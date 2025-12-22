@@ -1,7 +1,7 @@
 import discord
 from music.state import MusicState
 
-SYSTEM_ICON = "https://media.discordapp.net/attachments/1420115492580098272/1452743677720924311/IMG-20251220-WA0053.jpg?ex=694aec7b&is=69499afb&hm=575adb2a526d1c4ba291a4ae76aed9fde32a647f8672bdb98961658ab4bb7ed8&=&format=webp&width=978&height=978"
+SYSTEM_ICON = "https://media.discordapp.net/attachments/1420115492580098272/1452709148344062106/Mikey.png?ex=694acc52&is=69497ad2&hm=22b482987bea03204bab414b2eb2e489d644d4bc9585c9702d879b5b6d47ff24&=&format=webp&quality=lossless"
 
 
 def build_player_embed(state: MusicState) -> discord.Embed:
