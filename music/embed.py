@@ -1,66 +1,72 @@
 import discord
 from music.state import MusicState
 
-SYSTEM_ICON = "https://media.discordapp.net/attachments/1420115492580098272/1452743677720924311/IMG-20251220-WA0053.jpg?ex=694aec7b&is=69499afb&hm=575adb2a526d1c4ba291a4ae76aed9fde32a647f8672bdb98961658ab4bb7ed8&=&format=webp&width=978&height=978"
+SYSTEM_ICON = (
+    "https://media.discordapp.net/attachments/1420115492580098272/"
+    "1452709148344062106/Mikey.png"
+)
 
 
 def build_player_embed(state: MusicState) -> discord.Embed:
     """
-    Advanced unified music control panel embed.
-    Safe, scalable, and future-ready.
+    Unified production-grade music control embed
+    Compatible with Wavelink v3+
     """
 
-    track = state.current
+    track = state.current if state else None
 
-    # ================= EMBED BASE =================
+    # ============================================================
+    # EMBED BASE
+    # ============================================================
     embed = discord.Embed(
         title="🎵 Music Control Panel",
         description=(
-            "Control playback using the buttons below.\n"
-            "Queue, autoplay, and loop status are shown at the footer."
+            "Use the buttons below to control playback.\n"
+            "Autoplay, loop, and queue status are shown in the footer."
         ),
         color=discord.Color.blurple(),
     )
 
-    # ================= AUTHOR (ALWAYS SHOW) =================
-    if track and track.extras and hasattr(track.extras, "requester_name"):
-        requester_name = track.extras.requester_name
-        requester_avatar = getattr(track.extras, "requester_avatar", SYSTEM_ICON)
-    else:
-        requester_name = "Music System"
-        requester_avatar = SYSTEM_ICON
+    # ============================================================
+    # REQUESTER INFO (SAFE)
+    # ============================================================
+    requester_name = "Music System"
+    requester_avatar = SYSTEM_ICON
+    requester_tag = ""
+
+    if track and hasattr(track, "extras") and track.extras:
+        requester_name = getattr(track.extras, "requester_name", requester_name)
+        requester_avatar = getattr(track.extras, "requester_avatar", requester_avatar)
+        requester_tag = getattr(track.extras, "requester_tag", "")
 
     embed.set_author(
         name=f"Requested by {requester_name}",
         icon_url=requester_avatar,
     )
 
-    # ================= NOW PLAYING =================
+    # ============================================================
+    # NOW PLAYING
+    # ============================================================
     if track:
         embed.add_field(
-            name="🎶 Music Now Playing",
-            value=f"[{track.title}]({track.uri})",
+            name="🎶 Now Playing",
+            value=f"[{track.title}]({track.uri})" if track.uri else track.title,
             inline=False,
         )
 
-        # ---------- REQUESTED BY (INLINE) ----------
         embed.add_field(
             name="🎧 Requested By",
-            value=(
-                f"{requester_name} "
-                f"#{getattr(track.extras, 'requester_tag', '0000')}"
-                if track and track.extras and hasattr(track.extras, "requester_name")
-                else "Music System"
-            ),
+            value=f"{requester_name}#{requester_tag}" if requester_tag else requester_name,
             inline=True,
         )
 
-        # ---------- DURATION ----------
-        duration = (
-            f"{track.length // 60000}:{(track.length // 1000) % 60:02d}"
-            if track.length and track.length > 0
-            else "Live"
-        )
+        # Duration (safe for live streams)
+        if getattr(track, "length", 0):
+            minutes = track.length // 60000
+            seconds = (track.length // 1000) % 60
+            duration = f"{minutes}:{seconds:02d}"
+        else:
+            duration = "Live"
 
         embed.add_field(
             name="⏱ Duration",
@@ -68,15 +74,14 @@ def build_player_embed(state: MusicState) -> discord.Embed:
             inline=True,
         )
 
-        # ---------- ARTIST ----------
         embed.add_field(
             name="✍ Artist",
             value=track.author or "Unknown Artist",
             inline=True,
         )
 
-        # ---------- THUMBNAIL ----------
-        if track.artwork:
+        # Thumbnail (safe)
+        if getattr(track, "artwork", None):
             embed.set_thumbnail(url=track.artwork)
 
     else:
@@ -86,12 +91,16 @@ def build_player_embed(state: MusicState) -> discord.Embed:
             inline=False,
         )
 
-    # ================= FOOTER =================
+    # ============================================================
+    # FOOTER (SAFE)
+    # ============================================================
+    queue_size = len(state.queue) if state and state.queue else 0
+
     embed.set_footer(
         text=(
             f"Autoplay: {'ON' if state.autoplay else 'OFF'} • "
             f"Loop: {'ON' if state.loop else 'OFF'} • "
-            f"Queue: {len(state.queue)}\n"
+            f"Queue: {queue_size}\n"
             "© 2025 Mac GunJon • Music System"
         ),
         icon_url=requester_avatar,

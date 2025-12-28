@@ -10,136 +10,185 @@ from music.embed import build_player_embed
 
 def setup(tree):
 
-    @tree.command(name="play", description="Play a song or playlist")
+    @tree.command(
+        name="play",
+        description="Play a song or playlist (queue-safe, back-safe)",
+    )
     async def play(interaction: discord.Interaction, query: str):
+        # ==================================================
+        # INITIAL DEFER
+        # ==================================================
         await interaction.response.defer(thinking=True)
+
+        guild = interaction.guild
+        user = interaction.user
 
         # ==================================================
         # LAVALINK CHECK
         # ==================================================
         if not node_ready():
-            embed = discord.Embed(
-                title="❌ Music Service Unavailable",
-                description=(
-                    "The music backend (**Lavalink**) is currently **offline or unreachable**.\n\n"
-                    "Please try again later or contact the bot administrator."
+            return await interaction.followup.send(
+                embed=discord.Embed(
+                    title="❌ Music Service Offline",
+                    description=(
+                        "The music backend (**Lavalink**) is currently unavailable.\n\n"
+                        "Please try again later."
+                    ),
+                    color=discord.Color.red(),
                 ),
-                color=discord.Color.red(),
+                ephemeral=True,
             )
-            embed.set_footer(text="System Status • Lavalink")
-            return await interaction.followup.send(embed=embed, ephemeral=True)
 
         # ==================================================
         # VOICE CHANNEL CHECK
         # ==================================================
-        if not interaction.user.voice or not interaction.user.voice.channel:
-            embed = discord.Embed(
-                title="🔊 Voice Channel Required",
-                description="You must **join a voice channel** before using music commands.",
-                color=discord.Color.orange(),
+        if not user.voice or not user.voice.channel:
+            return await interaction.followup.send(
+                embed=discord.Embed(
+                    title="🔊 Voice Channel Required",
+                    description="Please **join a voice channel** before playing music.",
+                    color=discord.Color.orange(),
+                ),
+                ephemeral=True,
             )
-            embed.set_footer(text="User Action Required")
-            return await interaction.followup.send(embed=embed, ephemeral=True)
 
-        channel = interaction.user.voice.channel
+        channel = user.voice.channel
 
         # ==================================================
-        # CONNECT / GET PLAYER
+        # CONNECT / FETCH PLAYER (SAFE)
         # ==================================================
-        player: wavelink.Player = interaction.guild.voice_client
+        player: wavelink.Player = guild.voice_client
 
         if not player:
-            player = await channel.connect(cls=wavelink.Player)
+            try:
+                player = await channel.connect(cls=wavelink.Player)
+            except Exception:
+                player = guild.voice_client
+
         elif player.channel != channel:
             await player.move_to(channel)
 
         # ==================================================
-        # MUSIC STATE
+        # MUSIC STATE (ONE PER GUILD)
         # ==================================================
         state: MusicState = music_states.setdefault(
-            interaction.guild.id, MusicState()
+            guild.id,
+            MusicState(),
         )
+        state.player = player
+
+        # Reset manual flag on new /play
+        state.manual_action = False
 
         # ==================================================
-        # RESOLVE TRACKS (AUTO-CORRECT ENABLED)
+        # RESOLVE TRACKS (SAFE)
         # ==================================================
-        tracks = await resolve_tracks(query, interaction.user)
+        try:
+            tracks = await resolve_tracks(query, user)
+        except Exception as e:
+            print("[RESOLVE ERROR]", e)
+            tracks = None
 
         if not tracks:
-            embed = discord.Embed(
-                title="❌ No Results Found",
-                description=(
-                    "Could not find any playable tracks for your query.\n\n"
-                    "Please check spelling or try another song."
+            return await interaction.followup.send(
+                embed=discord.Embed(
+                    title="❌ No Results Found",
+                    description=(
+                        "No playable tracks were found for your query.\n\n"
+                        "Try another song name or URL."
+                    ),
+                    color=discord.Color.red(),
                 ),
-                color=discord.Color.red(),
+                ephemeral=True,
             )
-            embed.set_footer(text="Search Failed • Music System")
-            return await interaction.followup.send(embed=embed, ephemeral=True)
 
         # ==================================================
-        # PLAY / QUEUE LOGIC
+        # PLAY / QUEUE LOGIC (BACK + AUTOPLAY SAFE)
         # ==================================================
+        player_is_playing = bool(player.playing or player.paused)
+
         started_playback = False
         queued_only = True
 
         for track in tracks:
-            if not player.playing and not started_playback:
+
+            # ▶ CASE 1: PLAYER IDLE → PLAY IMMEDIATELY
+            if not player_is_playing and not started_playback:
+                # Update previous safely
                 state.previous = state.current
                 state.current = track
-                state.autoplay_seed = track
 
                 await player.play(track)
 
+                # Autoplay seed ONLY for actually played track
+                state.autoplay_seed = track
+
                 started_playback = True
                 queued_only = False
+
+            # 📥 CASE 2: PLAYER ACTIVE → QUEUE ONLY
             else:
                 state.queue.append(track)
 
         # ==================================================
-        # CONTROL PANEL (ALWAYS UPDATE)
+        # CONTROL PANEL UPDATE (UNIFIED)
         # ==================================================
         embed = build_player_embed(state)
-        view = MusicControlView(player, interaction.guild.id)
+        view = MusicControlView(player, guild.id)
 
-        if not state.message:
+        try:
+            if not state.message:
+                state.message = await interaction.followup.send(
+                    embed=embed,
+                    view=view,
+                )
+            else:
+                await state.message.edit(
+                    embed=embed,
+                    view=view,
+                )
+        except Exception:
             state.message = await interaction.followup.send(
                 embed=embed,
                 view=view,
             )
-        else:
-            await state.message.edit(
-                embed=embed,
-                view=view,
-            )
 
         # ==================================================
-        # AUTO-CORRECT NOTICE
+        # AUTO-CORRECT NOTICE (OPTIONAL)
         # ==================================================
-        if started_playback and state.current.extras.get("autocorrected"):
-            notice = discord.Embed(
-                title="🔎 Auto-Correct Applied",
-                description=(
-                    "Your search contained spelling errors.\n"
-                    "The closest matching track is now playing:\n\n"
-                    f"🎵 **{state.current.title}**"
+        autocorrected = False
+        if state.current and hasattr(state.current, "extras"):
+            autocorrected = getattr(
+                state.current.extras,
+                "autocorrected",
+                False,
+            )
+
+        if started_playback and autocorrected:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="🔎 Auto-Correct Applied",
+                    description=(
+                        "Your search contained spelling issues.\n\n"
+                        f"Now playing:\n🎵 **{state.current.title}**"
+                    ),
+                    color=discord.Color.green(),
                 ),
-                color=discord.Color.green(),
+                ephemeral=True,
             )
-            notice.set_footer(text="Smart Search • Music System")
-            await interaction.followup.send(embed=notice, ephemeral=True)
 
         # ==================================================
-        # QUEUE CONFIRMATION
+        # QUEUE CONFIRMATION (IF APPLICABLE)
         # ==================================================
         if queued_only:
-            embed = discord.Embed(
-                title="📥 Track Queued",
-                description=(
-                    "Your requested track has been **successfully added to the queue**.\n\n"
-                    "Playback will begin automatically when the current track finishes."
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="📥 Track Queued",
+                    description=(
+                        "Your requested track has been **added to the queue**.\n\n"
+                        "It will play automatically after the current song."
+                    ),
+                    color=discord.Color.blurple(),
                 ),
-                color=discord.Color.blurple(),
+                ephemeral=True,
             )
-            embed.set_footer(text="Queue Update • Music System")
-            await interaction.followup.send(embed=embed, ephemeral=True)

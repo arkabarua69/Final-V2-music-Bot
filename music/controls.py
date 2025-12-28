@@ -1,14 +1,21 @@
-import asyncio
 import random
 import discord
 import wavelink
-from discord.ui import View
+from discord.ui import View, button
+
 from music.state import music_states
 from music.embed import build_player_embed
+from music.cooldown import cooldown_manager
 
 
-# ================= CONTROLS =================
 class MusicControlView(View):
+    """
+    Unified production-grade music control panel
+    Handles:
+    - Back / Skip / Stop safely
+    - Autoplay conflict prevention
+    - Cooldown & anti-spam
+    """
 
     def __init__(self, player: wavelink.Player, guild_id: int):
         super().__init__(timeout=None)
@@ -16,26 +23,58 @@ class MusicControlView(View):
         self.guild_id = guild_id
         self._sync_buttons()
 
-    # ------------------ USER CHECK ------------------
+    # ==================================================
+    # COMMON HELPERS
+    # ==================================================
+    async def _defer(self, interaction: discord.Interaction):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+
+    async def _cooldown(self, interaction, key: str, seconds: float) -> bool:
+        remaining = cooldown_manager.check(interaction.user.id, key, seconds)
+        if remaining is not None:
+            await self._defer(interaction)
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="⏳ Cooldown Active",
+                    description=f"Please wait **{remaining:.1f}s** before using this control again.",
+                    color=discord.Color.orange(),
+                ),
+                ephemeral=True,
+            )
+            return True
+        return False
+
     async def _check_user(self, interaction: discord.Interaction) -> bool:
-        if not interaction.user.voice or interaction.user.voice.channel != self.player.channel:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    embed=discord.Embed(
-                        title="Access Restricted",
-                        description="To use this control, please join the same voice channel as the bot.",
-                        color=discord.Color.red(),
-                    ),
-                    ephemeral=True,
-                )
+        if not interaction.user.voice or not self.player or not self.player.channel:
+            await self._defer(interaction)
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="Access Denied",
+                    description="You must be connected to a voice channel.",
+                    color=discord.Color.red(),
+                ),
+                ephemeral=True,
+            )
             return False
+
+        if interaction.user.voice.channel != self.player.channel:
+            await self._defer(interaction)
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="Access Denied",
+                    description="You must be in the **same voice channel** as the bot.",
+                    color=discord.Color.red(),
+                ),
+                ephemeral=True,
+            )
+            return False
+
         return True
 
-    # ------------------ BUTTON STATE SYNC ------------------
     def _sync_buttons(self):
         state = music_states.get(self.guild_id)
 
-        # ✅ FIX: Wavelink compatible connection check
         has_player = bool(self.player and self.player.channel)
         has_queue = bool(state and state.queue)
         has_previous = bool(state and state.previous)
@@ -43,248 +82,303 @@ class MusicControlView(View):
         for item in self.children:
             if item.label in ("🔉 Down", "🔊 Up"):
                 item.disabled = not has_player
-
             elif item.label == "⏮ Back":
                 item.disabled = not has_previous
-
-            elif item.label in ("⏸ Pause", "▶ Resume"):
+            elif item.label in ("⏸ Pause", "▶ Resume", "⏭ Skip", "🔁 Loop", "🔄 Autoplay", "⏹ Stop"):
                 item.disabled = not has_player
-
-            elif item.label == "⏭ Skip":
-                item.disabled = not has_player
-
             elif item.label == "🔀 Shuffle":
                 item.disabled = not has_queue
 
-            elif item.label == "🔁 Loop":
-                item.disabled = not has_player
+    async def _update_panel(self):
+        state = music_states.get(self.guild_id)
+        if state and state.message:
+            try:
+                await state.message.edit(
+                    embed=build_player_embed(state),
+                    view=self,
+                )
+            except Exception:
+                pass
 
-            elif item.label == "🔄 Autoplay":
-                item.disabled = not has_player
-
-            elif item.label == "⏹ Stop":
-                item.disabled = not has_player
-
-    # ------------------ VOLUME DOWN ------------------
-    @discord.ui.button(label="🔉 Down", style=discord.ButtonStyle.secondary)
+    # ==================================================
+    # VOLUME DOWN
+    # ==================================================
+    @button(label="🔉 Down", style=discord.ButtonStyle.secondary)
     async def volume_down(self, interaction: discord.Interaction, _):
         if not await self._check_user(interaction):
             return
+        if await self._cooldown(interaction, "volume", 1.5):
+            return
 
-        new_volume = max(1, self.player.volume - 10)
+        await self._defer(interaction)
+
+        new_volume = max(1, getattr(self.player, "volume", 100) - 10)
         await self.player.set_volume(new_volume)
 
-        self._sync_buttons()
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=discord.Embed(
-                title="Audio Level Changed",
-                description=f"Playback volume successfully adjusted to **{new_volume}%**.",
+                title="🔉 Volume Changed",
+                description=f"Volume set to **{new_volume}%**",
                 color=discord.Color.blurple(),
             ),
             ephemeral=True,
         )
 
-    # ------------------ VOLUME UP ------------------
-    @discord.ui.button(label="🔊 Up", style=discord.ButtonStyle.secondary)
+    # ==================================================
+    # VOLUME UP
+    # ==================================================
+    @button(label="🔊 Up", style=discord.ButtonStyle.secondary)
     async def volume_up(self, interaction: discord.Interaction, _):
         if not await self._check_user(interaction):
             return
+        if await self._cooldown(interaction, "volume", 1.5):
+            return
 
-        new_volume = min(1000, self.player.volume + 10)
+        await self._defer(interaction)
+
+        new_volume = min(200, getattr(self.player, "volume", 100) + 10)
         await self.player.set_volume(new_volume)
 
-        self._sync_buttons()
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=discord.Embed(
-                title="Audio Level Changed",
-                description=f"Playback volume successfully adjusted to **{new_volume}%**.",
+                title="🔊 Volume Changed",
+                description=f"Volume set to **{new_volume}%**",
                 color=discord.Color.blurple(),
             ),
             ephemeral=True,
         )
 
-    # ------------------ BACK ------------------
-    @discord.ui.button(label="⏮ Back", style=discord.ButtonStyle.secondary)
+    # ==================================================
+    # BACK
+    # ==================================================
+    @button(label="⏮ Back", style=discord.ButtonStyle.secondary)
     async def back(self, interaction: discord.Interaction, _):
         if not await self._check_user(interaction):
             return
+        if await self._cooldown(interaction, "back", 3):
+            return
+
+        await self._defer(interaction)
 
         state = music_states.get(self.guild_id)
         if not state or not state.previous:
-            embed = discord.Embed(
-                title="⏮ Playback Reverted",
-                description="No previously played track is available.",
-                color=discord.Color.red(),
+            return await interaction.followup.send(
+                embed=discord.Embed(
+                    title="⏮ No Previous Track",
+                    description="There is no previously played track.",
+                    color=discord.Color.orange(),
+                ),
+                ephemeral=True,
             )
-            return await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        # 🔒 Disable autoplay temporarily
-        state.autoplay_enabled = False
+        # 🔒 ONE-TIME BACK (ANTI-LOOP)
+        state.manual_action = "back"
 
-        # ⛔ DO NOT push current track into queue
-        state.current = state.previous
-        state.previous = None
-        state.autoplay_seed = state.current
+        back_track = state.previous
 
-        # ✅ Force replace current track (prevents loop)
-        await self.player.play(state.current, replace=True)
+        # ❗ CRITICAL FIX
+        state.previous = None  # 🚫 prevents loop
+        state.current = back_track
+        state.autoplay_seed = back_track
 
-        self._sync_buttons()
+        await self.player.play(back_track, replace=True)
+        await self._update_panel()
 
-        embed = discord.Embed(
-            title="⏮ Playback Reverted",
-            description=f"Now playing:\n🎵 **{state.current.title}**",
-            color=discord.Color.green(),
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="⏮ Playing Previous Track",
+                description=f"Now playing **{back_track.title}**",
+                color=discord.Color.green(),
+            ),
+            ephemeral=True,
         )
-        embed.set_footer(text="Manual Control • Back")
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    # ------------------ PAUSE / RESUME ------------------
-    @discord.ui.button(label="⏸ Pause", style=discord.ButtonStyle.primary)
-    async def pause_resume(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ):
+    # ==================================================
+    # PAUSE / RESUME
+    # ==================================================
+    @button(label="⏸ Pause", style=discord.ButtonStyle.primary)
+    async def pause_resume(self, interaction: discord.Interaction, button):
         if not await self._check_user(interaction):
             return
+        if await self._cooldown(interaction, "pause", 2):
+            return
+
+        await self._defer(interaction)
+
+        state = music_states.get(self.guild_id)
+        if state:
+            state.manual_action = True
 
         if self.player.paused:
             await self.player.pause(False)
             button.label = "⏸ Pause"
+            msg = "▶ Playback resumed."
         else:
             await self.player.pause(True)
             button.label = "▶ Resume"
+            msg = "⏸ Playback paused."
 
-        self._sync_buttons()
-        await interaction.response.edit_message(view=self)
+        await interaction.message.edit(view=self)
 
-    # ------------------ SKIP ------------------
-    @discord.ui.button(label="⏭ Skip", style=discord.ButtonStyle.secondary)
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="Playback Control",
+                description=msg,
+                color=discord.Color.blurple(),
+            ),
+            ephemeral=True,
+        )
+
+    # ==================================================
+    # SKIP
+    # ==================================================
+    @button(label="⏭ Skip", style=discord.ButtonStyle.secondary)
     async def skip(self, interaction: discord.Interaction, _):
         if not await self._check_user(interaction):
             return
+        if await self._cooldown(interaction, "skip", 3):
+            return
+
+        await self._defer(interaction)
+
+        state = music_states.get(self.guild_id)
+
+        # 🔓 SKIP = NOT manual (autoplay allowed)
+        if state:
+            state.manual_action = False
 
         await self.player.stop()
 
-        self._sync_buttons()
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=discord.Embed(
                 title="⏭ Track Skipped",
-                description="The current track has been skipped successfully.",
+                description="Skipping to the next track.",
                 color=discord.Color.blurple(),
             ),
             ephemeral=True,
         )
 
-    # ------------------ SHUFFLE ------------------
-    @discord.ui.button(label="🔀 Shuffle", style=discord.ButtonStyle.secondary)
+    # ==================================================
+    # SHUFFLE
+    # ==================================================
+    @button(label="🔀 Shuffle", style=discord.ButtonStyle.secondary)
     async def shuffle(self, interaction: discord.Interaction, _):
         if not await self._check_user(interaction):
             return
+        if await self._cooldown(interaction, "shuffle", 3):
+            return
+
+        await self._defer(interaction)
 
         state = music_states.get(self.guild_id)
         if not state or not state.queue:
-            return
+            return await interaction.followup.send(
+                embed=discord.Embed(
+                    title="Queue Empty",
+                    description="There are no tracks to shuffle.",
+                    color=discord.Color.red(),
+                ),
+                ephemeral=True,
+            )
 
         random.shuffle(state.queue)
 
-        self._sync_buttons()
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=discord.Embed(
                 title="🔀 Queue Shuffled",
-                description="Tracks in the queue have been shuffled.",
-                color=discord.Color.blurple(),
+                description="The queue order has been randomized.",
+                color=discord.Color.green(),
             ),
             ephemeral=True,
         )
 
-    # ------------------ LOOP ------------------
-    @discord.ui.button(label="🔁 Loop", style=discord.ButtonStyle.secondary)
+    # ==================================================
+    # LOOP
+    # ==================================================
+    @button(label="🔁 Loop", style=discord.ButtonStyle.secondary)
     async def loop(self, interaction: discord.Interaction, _):
         if not await self._check_user(interaction):
             return
-
-        state = music_states.get(self.guild_id)
-        if not state:
+        if await self._cooldown(interaction, "loop", 3):
             return
 
+        await self._defer(interaction)
+
+        state = music_states.get(self.guild_id)
         state.loop = not state.loop
 
-        self._sync_buttons()
-        await interaction.response.send_message(
+        await self._update_panel()
+
+        await interaction.followup.send(
             embed=discord.Embed(
-                title="🔁 Playback Loop",
-                description=f"Continuous playback is now **{'active' if state.loop else 'inactive'}**.",
+                title="🔁 Loop Mode",
+                description=f"Loop is now **{'ENABLED' if state.loop else 'DISABLED'}**",
                 color=discord.Color.green() if state.loop else discord.Color.red(),
             ),
             ephemeral=True,
         )
 
-    # ------------------ AUTOPLAY ------------------
-    @discord.ui.button(label="🔄 Autoplay", style=discord.ButtonStyle.secondary)
+    # ==================================================
+    # AUTOPLAY
+    # ==================================================
+    @button(label="🔄 Autoplay", style=discord.ButtonStyle.secondary)
     async def autoplay(self, interaction: discord.Interaction, _):
         if not await self._check_user(interaction):
             return
-
-        state = music_states.get(self.guild_id)
-        if not state:
-            await interaction.response.send_message(
-                embed=discord.Embed(
-                    title="❌ Music Error",
-                    description="Music state not found. Please start playback using **/play**.",
-                    color=discord.Color.red(),
-                ),
-                ephemeral=True,
-            )
+        if await self._cooldown(interaction, "autoplay", 3):
             return
 
-        # 🔁 Toggle autoplay
+        await self._defer(interaction)
+
+        state = music_states.get(self.guild_id)
         state.autoplay = not state.autoplay
 
         if state.autoplay and not state.autoplay_seed and state.current:
             state.autoplay_seed = state.current
 
-        # 🔄 Sync buttons
-        self._sync_buttons()
+        await self._update_panel()
 
-        # 🔥 UPDATE MAIN CONTROL PANEL EMBED
-        if state.message:
-            await state.message.edit(
-                embed=build_player_embed(state),
-                view=self
-            )
-
-        # 🔔 Ephemeral confirmation
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=discord.Embed(
                 title="🔄 Autoplay",
-                description=(
-                    "Smart autoplay is now **ENABLED**."
-                    if state.autoplay
-                    else "Smart autoplay is now **DISABLED**."
-                ),
+                description=f"Autoplay is now **{'ENABLED' if state.autoplay else 'DISABLED'}**",
                 color=discord.Color.green() if state.autoplay else discord.Color.red(),
             ),
             ephemeral=True,
         )
 
-    # ------------------ STOP ------------------
-    @discord.ui.button(label="⏹ Stop", style=discord.ButtonStyle.danger)
+    # ==================================================
+    # STOP
+    # ==================================================
+    @button(label="⏹ Stop", style=discord.ButtonStyle.danger)
     async def stop(self, interaction: discord.Interaction, _):
         if not await self._check_user(interaction):
             return
+        if await self._cooldown(interaction, "stop", 5):
+            return
 
-        await self.player.disconnect()
+        await self._defer(interaction)
+
+        state = music_states.get(self.guild_id)
+        if state:
+            state.manual_action = True
+
+        try:
+            await self.player.disconnect(force=True)
+        except Exception:
+            pass
+
         music_states.pop(self.guild_id, None)
 
-        self._sync_buttons()
-        await interaction.response.edit_message(view=None)
+        try:
+            await interaction.message.edit(view=None)
+        except Exception:
+            pass
+
         await interaction.followup.send(
             embed=discord.Embed(
-                title="Music Stopped",
-                description="Playback has ended and the bot has left the voice channel.",
+                title="⏹ Music Stopped",
+                description="Playback stopped and the bot has left the voice channel.",
                 color=discord.Color.red(),
             ),
             ephemeral=True,

@@ -1,4 +1,6 @@
+import os
 import asyncio
+import signal
 import discord
 import wavelink
 
@@ -14,65 +16,93 @@ import commands.info
 from music.state import music_states
 from music.embed import build_player_embed
 from music.controls import MusicControlView
+from music.autoplay import get_autoplay_track
 
 
-# ================= WAVELINK TRACK END (SAFE) =================
+# ============================================================
+# WAVELINK TRACK END HANDLER (PRODUCTION SAFE)
+# ============================================================
 @bot.listen("on_wavelink_track_end")
-async def on_track_end(payload: wavelink.TrackEndEventPayload):
-    player = payload.player
+async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
+    player: wavelink.Player = payload.player
     guild = getattr(player, "guild", None)
 
     if not player or not guild:
         return
 
-    state = music_states.get(guild.id)
+    guild_id = guild.id
+    state = music_states.get(guild_id)
     if not state:
         return
 
-    # 🔁 LOOP
+    # --------------------------------------------------
+    # 🔁 LOOP MODE
+    # --------------------------------------------------
     if state.loop and state.current:
         await player.play(state.current)
         return
 
-    # 📜 QUEUE
+    # --------------------------------------------------
+    # 📜 QUEUE MODE
+    # --------------------------------------------------
     if state.queue:
         state.previous = state.current
         state.current = state.queue.pop(0)
+        state.autoplay_seed = state.current
+        state.manual_action = None
+
         await player.play(state.current)
-
-    # 🔄 AUTOPLAY
-    elif state.autoplay and state.autoplay_seed:
-        from music.autoplay import get_autoplay_track
-
-        next_track = await get_autoplay_track(state)
-        if next_track:
-            state.previous = state.current
-            state.current = next_track
-            await player.play(next_track)
-        else:
-            await cleanup_player(player, state)
-            return
-    else:
-        await cleanup_player(player, state)
+        await _update_panel(state, player, guild_id)
         return
 
-    # 🔄 UPDATE UI
+    # --------------------------------------------------
+    # 🔄 AUTOPLAY MODE
+    # --------------------------------------------------
+    if state.autoplay:
+        if state.manual_action == "back":
+            # ⏮ back was one-time only → resume autoplay next
+            state.manual_action = None
+        else:
+            next_track = await get_autoplay_track(state)
+            if next_track:
+                state.previous = state.current
+                state.current = next_track
+                state.autoplay_seed = next_track
+
+                await player.play(next_track)
+                await _update_panel(state, player, guild_id)
+                return
+
+    # --------------------------------------------------
+    # 🧹 CLEANUP (REAL END ONLY)
+    # --------------------------------------------------
+    if state.manual_action:
+        state.manual_action = None
+        return
+
+    await cleanup_player(player, state, guild_id)
+
+
+# ============================================================
+# UPDATE CONTROL PANEL
+# ============================================================
+async def _update_panel(state, player, guild_id):
     if state.message:
         try:
             await state.message.edit(
                 embed=build_player_embed(state),
-                view=MusicControlView(player, guild.id),
+                view=MusicControlView(player, guild_id),
             )
-        except Exception as e:
-            print("[UI UPDATE ERROR]", e)
+        except Exception:
+            pass
 
 
-# ================= CLEANUP =================
-async def cleanup_player(player, state):
-    guild_id = getattr(player.guild, "id", None)
-
+# ============================================================
+# CLEANUP PLAYER
+# ============================================================
+async def cleanup_player(player: wavelink.Player, state, guild_id: int):
     try:
-        await player.disconnect()
+        await player.disconnect(force=True)
     except Exception:
         pass
 
@@ -81,7 +111,7 @@ async def cleanup_player(player, state):
             await state.message.edit(
                 embed=discord.Embed(
                     title="Playback Finished",
-                    description="Queue ended. Bot disconnected.",
+                    description="Queue ended. Playback stopped.",
                     color=discord.Color.red(),
                 ),
                 view=None,
@@ -89,35 +119,58 @@ async def cleanup_player(player, state):
         except Exception:
             pass
 
-    if guild_id:
-        music_states.pop(guild_id, None)
+    music_states.pop(guild_id, None)
 
 
-# ================= BOT READY =================
+# ============================================================
+# BOT READY
+# ============================================================
 @bot.event
 async def on_ready():
+    print("🔌 Connecting Lavalink...")
     await connect_lavalink(bot)
 
     commands.play.setup(tree)
     commands.basic.setup(tree)
     commands.info.setup(tree)
 
-    await tree.sync()
-    print(f"Logged in as {bot.user}")
+    if not getattr(bot, "_synced", False):
+        await tree.sync()
+        bot._synced = True
+
+    print(f"✅ Logged in as {bot.user}")
 
 
-# ================= AUTO RESTART SYSTEM =================
-async def start_bot():
-    while True:
+# ============================================================
+# GRACEFUL SHUTDOWN
+# ============================================================
+async def shutdown():
+    print("🛑 Shutting down bot...")
+
+    for guild_id in list(music_states.keys()):
         try:
-            await bot.start(TOKEN)
-        except Exception as e:
-            print("🔥 BOT CRASHED:", e)
-            print("♻️ Restarting in 5 seconds...")
-            await asyncio.sleep(5)
+            guild = bot.get_guild(guild_id)
+            if guild and guild.voice_client:
+                await guild.voice_client.disconnect(force=True)
+        except Exception:
+            pass
+
+    await bot.close()
 
 
-# ================= START =================
-run_server()
+def handle_exit():
+    asyncio.get_event_loop().create_task(shutdown())
 
-asyncio.run(start_bot())
+
+# ============================================================
+# MAIN ENTRY POINT
+# ============================================================
+if __name__ == "__main__":
+    # Start keep-alive only for hosting platforms
+    if os.getenv("RENDER") or os.getenv("RAILWAY"):
+        run_server()
+
+    signal.signal(signal.SIGTERM, lambda *_: handle_exit())
+    signal.signal(signal.SIGINT, lambda *_: handle_exit())
+
+    bot.run(TOKEN)

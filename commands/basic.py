@@ -1,7 +1,10 @@
 from discord import Interaction, Embed, Color
-from music.state import music_states
 import random
 import wavelink
+
+from music.state import music_states
+from music.embed import build_player_embed
+from music.controls import MusicControlView
 
 
 def setup(tree):
@@ -9,7 +12,10 @@ def setup(tree):
     # ------------------ /join ------------------
     @tree.command(name="join", description="Join your voice channel")
     async def join(interaction: Interaction):
-        if not interaction.user.voice:
+        user = interaction.user
+        guild = interaction.guild
+
+        if not user.voice or not user.voice.channel:
             return await interaction.response.send_message(
                 embed=Embed(
                     title="Voice Channel Required",
@@ -19,21 +25,18 @@ def setup(tree):
                 ephemeral=True,
             )
 
-        if interaction.guild.voice_client:
-            return await interaction.response.send_message(
-                embed=Embed(
-                    title="Already Connected",
-                    description="I am already connected to a voice channel.",
-                    color=Color.orange(),
-                ),
-                ephemeral=True,
-            )
+        player: wavelink.Player = guild.voice_client
+        channel = user.voice.channel
 
-        await interaction.user.voice.channel.connect(cls=wavelink.Player)
+        if not player:
+            await channel.connect(cls=wavelink.Player)
+        elif player.channel != channel:
+            await player.move_to(channel)
+
         await interaction.response.send_message(
             embed=Embed(
                 title="Connected",
-                description=f"Joined **{interaction.user.voice.channel.name}**",
+                description=f"Joined **{channel.name}**",
                 color=Color.green(),
             )
         )
@@ -41,7 +44,10 @@ def setup(tree):
     # ------------------ /leave ------------------
     @tree.command(name="leave", description="Leave the voice channel")
     async def leave(interaction: Interaction):
-        player: wavelink.Player = interaction.guild.voice_client
+        guild = interaction.guild
+        player: wavelink.Player = guild.voice_client
+        state = music_states.get(guild.id)
+
         if not player:
             return await interaction.response.send_message(
                 embed=Embed(
@@ -52,8 +58,19 @@ def setup(tree):
                 ephemeral=True,
             )
 
-        await player.disconnect()
-        music_states.pop(interaction.guild.id, None)
+        try:
+            await player.disconnect(force=True)
+        except Exception:
+            pass
+
+        if state:
+            if state.message:
+                try:
+                    await state.message.edit(embed=None, view=None)
+                except Exception:
+                    pass
+            state.reset()
+            music_states.pop(guild.id, None)
 
         await interaction.response.send_message(
             embed=Embed(
@@ -127,13 +144,13 @@ def setup(tree):
         await interaction.response.send_message(
             embed=Embed(
                 title="Track Skipped",
-                description="The current track has been skipped.",
+                description="Skipping to the next track.",
                 color=Color.blurple(),
             )
         )
 
     # ------------------ /volume ------------------
-    @tree.command(name="volume", description="Set playback volume (1-1000)")
+    @tree.command(name="volume", description="Set playback volume (1-200)")
     async def volume(interaction: Interaction, level: int):
         player: wavelink.Player = interaction.guild.voice_client
         if not player:
@@ -146,7 +163,7 @@ def setup(tree):
                 ephemeral=True,
             )
 
-        level = max(1, min(1000, level))
+        level = max(1, min(200, level))
         await player.set_volume(level)
 
         await interaction.response.send_message(
@@ -161,7 +178,9 @@ def setup(tree):
     @tree.command(name="seek", description="Seek the current track (seconds)")
     async def seek(interaction: Interaction, seconds: int):
         player: wavelink.Player = interaction.guild.voice_client
-        if not player or not player.playing:
+        state = music_states.get(interaction.guild.id)
+
+        if not player or not player.playing or not state or not state.current:
             return await interaction.response.send_message(
                 embed=Embed(
                     title="Nothing Playing",
@@ -170,6 +189,9 @@ def setup(tree):
                 ),
                 ephemeral=True,
             )
+
+        max_seconds = (state.current.length or 0) // 1000
+        seconds = max(0, min(seconds, max_seconds))
 
         await player.seek(seconds * 1000)
         await interaction.response.send_message(
@@ -207,6 +229,8 @@ def setup(tree):
     @tree.command(name="loop", description="Toggle loop mode")
     async def loop(interaction: Interaction):
         state = music_states.get(interaction.guild.id)
+        player = interaction.guild.voice_client
+
         if not state:
             return await interaction.response.send_message(
                 embed=Embed(
@@ -226,10 +250,18 @@ def setup(tree):
             )
         )
 
+        if state.message and player:
+            await state.message.edit(
+                embed=build_player_embed(state),
+                view=MusicControlView(player, interaction.guild.id),
+            )
+
     # ------------------ /autoplay ------------------
     @tree.command(name="autoplay", description="Toggle autoplay mode")
     async def autoplay(interaction: Interaction):
         state = music_states.get(interaction.guild.id)
+        player = interaction.guild.voice_client
+
         if not state:
             return await interaction.response.send_message(
                 embed=Embed(
@@ -251,6 +283,12 @@ def setup(tree):
                 color=Color.green() if state.autoplay else Color.red(),
             )
         )
+
+        if state.message and player:
+            await state.message.edit(
+                embed=build_player_embed(state),
+                view=MusicControlView(player, interaction.guild.id),
+            )
 
     # ------------------ /clear ------------------
     @tree.command(name="clear", description="Clear the music queue")
